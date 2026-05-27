@@ -3,12 +3,12 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="台股法人雙強連買篩選系統", layout="wide")
-st.title("🔥 籌碼雙增選股 - 外資與投信同步連買 3 日")
+st.set_page_config(page_title="台股法人籌碼大師", layout="wide")
 
-# 抓取證交所三大法人買賣超數據 (每日下午 3:00 更新)
+# --- 核心資料抓取與快取函數 ---
 @st.cache_data(ttl=3600)
 def get_twse_data(date_str):
+    """從證交所抓取當日所有股票的法人買賣超與持股資料"""
     url = f"https://www.twse.com.tw/rwd/zh/fund/T86KJ7?date={date_str}&selectType=ALL&response=json"
     try:
         response = requests.get(url, timeout=10)
@@ -21,35 +21,43 @@ def get_twse_data(date_str):
             df['證券代號'] = df['證券代號'].str.strip()
             df['證券名稱'] = df['證券名稱'].str.strip()
             
-            # 將數值欄位轉為數字並換算為張數 (股數 / 1000)
+            # 轉換數值欄位（處理千分位逗號）
             df['收盤價'] = pd.to_numeric(df['收盤價'].astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0)
             
-            # 轉換外資與投信買賣超股數
-            foreign_net = pd.to_numeric(df['外資買賣超股數'].astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0)
-            sitc_net = pd.to_numeric(df['投信買賣超股數'].astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0)
+            # 買進賣出股數轉張數
+            df['外資買進(張)'] = (pd.to_numeric(df['外資買進股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
+            df['外資賣出(張)'] = (pd.to_numeric(df['外資賣出股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
+            df['外資買賣超(張)'] = (pd.to_numeric(df['外資買賣超股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
             
-            df['外資買賣超(張)'] = (foreign_net / 1000).round(1)
-            df['投信買賣超(張)'] = (sitc_net / 1000).round(1)
+            df['投信買進(張)'] = (pd.to_numeric(df['投信買進股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
+            df['投信賣出(張)'] = (pd.to_numeric(df['投信賣出股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
+            df['投信買賣超(張)'] = (pd.to_numeric(df['投信買賣超股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(1)
             
-            # 持股比例與張數
-            df['持股張數'] = (pd.to_numeric(df['外資持股股數'].astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0) / 1000).round(0)
-            df['外資持股比率(%)'] = pd.to_numeric(df['外資持股比率'].astype(str).str.replace(',', '').str.strip(), errors='coerce').fillna(0)
+            # 持股張數與比率
+            df['外資持股張數'] = (pd.to_numeric(df['外資持股股數'].astype(str).str.replace(',', ''), errors='coerce').fillna(0) / 1000).round(0)
+            df['外資持股比率(%)'] = pd.to_numeric(df['外資持股比率'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
             
-            return df[['證券代號', '證券名稱', '收盤價', '外資買賣超(張)', '投信買賣超(張)', '持股張數', '外資持股比率(%)']]
+            # 備註：官方無當日投信持股總量，以0或相對應資料代入，此處保留欄位給前端顯示
+            df['投信持股張數'] = 0 
+            df['投信持股比率(%)'] = 0
+            
+            # 漲跌欄位處理
+            df['漲跌'] = df['漲跌'].astype(str)
+            
+            return df[['證券代號', '證券名稱', '收盤價', '漲跌', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)', '外資持股張數', '外資持股比率(%)', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']]
         else:
             return pd.DataFrame()
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
-# 核心邏輯：往回尋找 3 個有效的交易日
-def get_last_3_trading_days(start_date):
+# 根據天數取得歷史交易日資料
+def get_historical_data(start_date, max_days=30):
     valid_dfs = []
     dates_list = []
     current_date = start_date
     attempts = 0
-    
-    # 最多往回嘗試 10 天以避開週休二日與國定假日
-    while len(valid_dfs) < 3 and attempts < 10:
+    # 30天數據因包含週末，最多往回找 50 天
+    while len(valid_dfs) < max_days and attempts < max_days * 2:
         date_str = current_date.strftime("%Y%m%d")
         day_df = get_twse_data(date_str)
         if not day_df.empty:
@@ -57,67 +65,130 @@ def get_last_3_trading_days(start_date):
             dates_list.append(current_date.strftime("%Y-%m-%d"))
         current_date -= timedelta(days=1)
         attempts += 1
-        
     return valid_dfs, dates_list
 
-# --- 側邊欄控制面板 ---
-st.sidebar.header("⚙️ 篩選設定")
-today = datetime.today()
-target_date = st.sidebar.date_input("選擇基準日期（通常選今天）", today)
+# --- 全域側邊欄設定 ---
+st.sidebar.header("📅 基準日期設定")
+target_date = st.sidebar.date_input("選擇基準日期", datetime.today())
+st.sidebar.markdown("---")
 
-st.sidebar.info("💡 系統會自動由基準日往回推算 3 個開盤交易日，找出外資與投信「天天都在買」的股票。")
+# 預先抓取最多 22 個交易日（約一個月）的資料
+with st.spinner('正在從證交所載入歷史籌碼數據...'):
+    # 22個交易日代表一個月
+    dfs, dates_found = get_historical_data(target_date, max_days=22)
 
-# --- 資料運算 ---
-with st.spinner('正在分析近 3 個交易日的法人籌碼動向...'):
-    dfs, dates_found = get_last_3_trading_days(target_date)
+if len(dfs) > 0:
+    # --- 分頁系統設計 ---
+    tab1, tab2, tab3 = st.tabs(["🎯 法人連買選股專區", "🦅 外資進出觀測站", "🐯 投信進出觀測站"])
+    
+    # 最新一天的基準資料
+    df_latest = dfs[0].copy()
+    
+    # ==========================================
+    # 第一頁面：外資及投信連買超 3日、5日
+    # ==========================================
+    with tab1:
+        st.subheader("🔥 外資與投信聯手連買篩選")
+        filter_days = st.radio("請選擇連續買超天數：", [3, 5], horizontal=True)
+        
+        if len(dfs) >= filter_days:
+            # 計算連買
+            cond_foreign = True
+            cond_sitc = True
+            for i in range(filter_days):
+                cond_foreign &= (dfs[i]['外資買賣超(張)'] > 0)
+                cond_sitc &= (dfs[i]['投信買賣超(張)'] > 0)
+            
+            # 連買代號清單
+            ids_foreign = dfs[0][cond_foreign]['證券代號'].tolist()
+            ids_sitc = dfs[0][cond_sitc]['證券代號'].tolist()
+            
+            # 取交集（外資與投信都連買）
+            inter_ids = list(set(ids_foreign) & set(ids_sitc))
+            
+            # 篩選最新一天的資料來呈現
+            result_tab1 = df_latest[df_latest['證券代號'].isin(inter_ids)].copy()
+            
+            # 計算連買期間的累積買超張數
+            f_sum = sum(dfs[i]['外資買賣超(張)'] for i in range(filter_days))
+            s_sum = sum(dfs[i]['投信買賣超(張)'] for i in range(filter_days))
+            
+            # 美化呈現表格
+            show_cols_tab1 = [
+                '證券代號', '證券名稱', '收盤價', '漲跌', 
+                '外資買賣超(張)', '外資持股張數', '外資持股比率(%)', 
+                '投信買賣超(張)', '投信持股張數', '投信持股比率(%)'
+            ]
+            
+            if not result_tab1.empty:
+                st.success(f"🎉 成功找出 {len(result_tab1)} 檔外資與投信同步連買 {filter_days} 日的黃金股！")
+                display_df1 = result_tab1[show_cols_tab1].copy()
+                display_df1.columns = ['股號', '股名', '股價', '漲跌', '外資當日買超(張)', '外資持股張數', '外資持股比率(%)', '投信當日買超(張)', '投信持股張數', '投信持股比率(%)']
+                st.dataframe(display_df1.reset_index(drop=True), use_container_width=True)
+            else:
+                st.info(f"💡 目前連續 {filter_days} 日無兩大法共同連買的股票。")
+        else:
+            st.warning(f"⚠️ 歷史交易日資料不足以計算 {filter_days} 日連買。")
 
-if len(dfs) == 3:
-    st.subheader(f"🔍 正在比對以下 3 個交易日的資料：{', '.join(dates_found)}")
-    
-    # 提取各天的數據
-    df_day0 = dfs[0] # 最新一天
-    df_day1 = dfs[1] # 昨天
-    df_day2 = dfs[2] # 前天
-    
-    # 將三天的資料透過「證券代號」串聯
-    m1 = pd.merge(df_day0, df_day1, on=['證券代號', '證券名稱'], suffixes=('_t0', '_t1'))
-    final_merged = pd.merge(m1, df_day2, on=['證券代號', '證券名稱'])
-    # 重新命名最後一天的欄位以防混淆
-    final_merged = final_merged.rename(columns={'外資買賣超(張)': '外資買賣超(張)_t2', '投信買賣超(張)': '投信買賣超(張)_t2'})
-    
-    # 核心條件篩選：
-    # 外資三天都買超 (>0) 且 投信三天都買超 (>0)
-    cond_foreign = (final_merged['外資買賣超(張)_t0'] > 0) & (final_merged['外資買賣超(張)_t1'] > 0) & (final_merged['外資買賣超(張)_t2'] > 0)
-    cond_sitc = (final_merged['投信買賣超(張)_t0'] > 0) & (final_merged['投信買賣超(張)_t1'] > 0) & (final_merged['投信買賣超(張)_t2'] > 0)
-    
-    result_df = final_merged[cond_foreign & cond_sitc].copy()
-    
-    if not result_df.empty:
-        # 整理輸出欄位（顯示最新一天的收盤價、持股資訊，以及三天各自買超張數的加總作為排序依據）
-        result_df['近3日外資總買超'] = (result_df['外資買賣超(張)_t0'] + result_df['外資買賣超(張)_t1'] + result_df['外資買賣超(張)_t2']).round(1)
-        result_df['近3日投信總買超'] = (result_df['投信買賣超(張)_t0'] + result_df['投信買賣超(張)_t1'] + result_df['投信買賣超(張)_t2']).round(1)
+    # ==========================================
+    # 第二頁面：外資進出(當日、2日、3日、5日、10日、1個月)
+    # ==========================================
+    with tab2:
+        st.subheader("🦅 外資多週期進出排行")
+        period_f = st.selectbox("請選擇觀測週期（外資）：", ["當日", "2日", "3日", "5日", "10日", "1個月（22日）"])
         
-        # 挑選最終呈現欄位
-        display_cols = [
-            '證券代號', '證券名稱', '收盤價_t0', 
-            '近3日外資總買超', '近3日投信總買超', 
-            '持股張數_t0', '外資持股比率(%)_t0'
-        ]
+        # 對應要加總的天數
+        day_mapping = {"當日": 1, "2日": 2, "3日": 3, "5日": 5, "10日": 10, "1個月（22日）": 22}
+        target_len = min(day_mapping[period_f], len(dfs))
         
-        clean_df = result_df[display_cols].copy()
-        clean_df.columns = ['股號', '股名', '最新股價', '外資3日累計(張)', '投信3日累計(張)', '外資持股張數', '外資持股比率(%)']
+        # 計算週期內的累計買賣超
+        cum_net_f = sum(dfs[i]['外資買賣超(張)'] for i in range(target_len))
+        cum_buy_f = sum(dfs[i]['外資買進(張)'] for i in range(target_len))
+        cum_sell_f = sum(dfs[i]['外資賣出(張)'] for i in range(target_len))
         
-        # 依外資買超總量排序
-        clean_df = clean_df.sort_values(by='外資3日累計(張)', ascending=False).reset_index(drop=True)
+        df_f_period = df_latest[['證券代號', '證券名稱', '收盤價', '漲跌', '外資持股張數', '外資持股比率(%)']].copy()
+        df_f_period['外資買進(張)'] = cum_buy_f
+        df_f_period['外資賣出(張)'] = cum_sell_f
+        df_f_period['外資買賣超(張)'] = cum_net_f
         
-        # 顯示成果
-        st.success(f"🎉 成功找出 {len(clean_df)} 檔外資與投信同步連買 3 日的黃金交集股！")
-        st.dataframe(clean_df, use_container_width=True)
+        # 依買賣超排序
+        df_f_period = df_f_period.sort_values(by='外資買賣超(張)', ascending=False).reset_index(drop=True)
         
-        # 下載功能
-        csv = clean_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下載雙強連買選股清單 (CSV)", data=csv, file_name=f"雙法人連買3日_{target_date.strftime('%Y%m%d')}.csv", mime='text/csv')
-    else:
-        st.info("○ 這三天的市場中，沒有任何股票同時符合「外資連買3天」且「投信連買3天」的條件。可以嘗試換個日期基準試試看。")
+        show_cols_tab2 = ['證券代號', '證券名稱', '收盤價', '漲跌', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)', '外資持股張數', '外資持股比率(%)']
+        display_df2 = df_f_period[show_cols_tab2].copy()
+        display_df2.columns = ['股號', '股名', '股價', '漲跌', f'外資{period_f}買進(張)', f'外資{period_f}賣出(張)', f'外資{period_f}買賣超(張)', '外資持股張數', '外資持股比率(%)']
+        
+        st.caption(f"📊 已計算近 {target_len} 個交易日累計數據（基準日：{dates_found[0]}）")
+        st.dataframe(display_df2, use_container_width=True)
+
+    # ==========================================
+    # 第三頁面：投信進出(當日、2日、3日、5日、10日、1個月)
+    # ==========================================
+    with tab3:
+        st.subheader("🐯 投信多週期進出排行")
+        period_s = st.selectbox("請選擇觀測週期（投信）：", ["當日", "2日", "3日", "5日", "10日", "1個月（22日）"])
+        
+        target_len_s = min(day_mapping[period_s], len(dfs))
+        
+        # 計算週期內的累計買賣超
+        cum_net_s = sum(dfs[i]['投信買賣超(張)'] for i in range(target_len_s))
+        cum_buy_s = sum(dfs[i]['投信買進(張)'] for i in range(target_len_s))
+        cum_sell_s = sum(dfs[i]['投信賣出(張)'] for i in range(target_len_s))
+        
+        df_s_period = df_latest[['證券代號', '證券名稱', '收盤價', '漲跌', '投信持股張數', '投信持股比率(%)']].copy()
+        df_s_period['投信買進(張)'] = cum_buy_s
+        df_s_period['投信賣出(張)'] = cum_sell_s
+        df_s_period['投信買賣超(張)'] = cum_net_s
+        
+        # 依買賣超排序
+        df_s_period = df_s_period.sort_values(by='投信買賣超(張)', ascending=False).reset_index(drop=True)
+        
+        show_cols_tab3 = ['證券代號', '證券名稱', '收盤價', '漲跌', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']
+        display_df3 = df_s_period[show_cols_tab3].copy()
+        display_df3.columns = ['股號', '股名', '股價', '漲跌', f'投信{period_s}買進(張)', f'投信{period_s}賣出(張)', f'投信{period_s}買賣超(張)', '投信持股張數', '投信持股比率(%)']
+        
+        st.caption(f"📊 已計算近 {target_len_s} 個交易日累計數據（基準日：{dates_found[0]}）")
+        st.dataframe(display_df3, use_container_width=True)
+
 else:
-    st.warning("⚠️ 無法取得足夠的交易日資料，可能因為目前是週末、國定假日，或證交所尚未釋出今日數據（每日 15:00 更新）。請在側邊欄切換基準日期。")
+    st.warning("⚠️ 無法取得任何有效的交易日資料，請換個日期試試看。")
