@@ -72,7 +72,7 @@ with st.spinner('正在分析近 3 個交易日的法人籌碼動向...'):
     dfs, dates_found = get_last_3_trading_days(target_date)
 
 if len(dfs) == 3:
-    st.subheader(比對交易日：f"🔍 正在比對以下 3 個交易日的資料：{', '.join(dates_found)}")
+    st.subheader(f"🔍 正在比對以下 3 個交易日的資料：{', '.join(dates_found)}")
     
     # 提取各天的數據
     df_day0 = dfs[0] # 最新一天
