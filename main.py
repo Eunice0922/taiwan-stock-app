@@ -142,6 +142,38 @@ if len(dfs) > 0:
     # ==========================================
     # 第二頁面：外資排行
     # ==========================================
+    # ==========================================
+    # 第二頁面：外資排行
+    # ==========================================
     with tab2:
         st.subheader("🦅 外資多週期進出排行 (真實張數)")
-        period_f = st.selectbox("請選擇觀測週期（外資）：",
+        period_f = st.selectbox("請選擇觀測週期（外資）：", ["當日", "2日", "3日", "5日"], key="p2_select")
+        day_mapping = {"當日": 1, "2日": 2, "3日": 3, "5日": 5}
+        target_len = min(day_mapping[period_f], len(dfs))
+        
+        df_f_period = df_latest[['證券代號', '證券名稱', '收盤價', '漲跌', '外資持股張數', '外資持股比率(%)']].copy()
+        
+        # 修正計算邏輯，先計算總和再指定給新欄位
+        total_f_net = sum([dfs[i]['外資買賣超(張)'] for i in range(target_len)])
+        df_f_period[f'外資{period_f}買賣超(張)'] = total_f_net
+        
+        df_f_period = df_f_period.sort_values(by=f'外資{period_f}買賣超(張)', ascending=False).reset_index(drop=True)
+        st.dataframe(df_f_period, use_container_width=True)
+
+    # ==========================================
+    # 第三頁面：投信排行
+    # ==========================================
+    with tab3:
+        st.subheader("🐯 投信多週期進出排行 (真實張數)")
+        period_s = st.selectbox("請選擇觀測週期（投信）：", ["當日", "2日", "3日", "5日"], key="p3_select")
+        day_mapping_s = {"當日": 1, "2日": 2, "3日": 3, "5日": 5}
+        target_len_s = min(day_mapping_s[period_s], len(dfs))
+        
+        df_s_period = df_latest[['證券代號', '證券名稱', '收盤價', '漲跌', '投信持股張數', '投信持股比率(%)']].copy()
+        
+        # 修正計算邏輯，先計算總和再指定給新欄位
+        total_s_net = sum([dfs[i]['投信買賣超(張)'] for i in range(target_len_s)])
+        df_s_period[f'投信{period_s}買賣超(張)'] = total_s_net
+        
+        df_s_period = df_s_period.sort_values(by=f'投信{period_s}買賣超(張)', ascending=False).reset_index(drop=True)
+        st.dataframe(df_s_period, use_container_width=True)
