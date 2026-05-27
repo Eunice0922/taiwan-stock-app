@@ -6,75 +6,93 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="台股法人籌碼大師", layout="wide")
 
 # --- 核心資料抓取與快取函數 ---
-def get_twse_data(date_str):
-    """從證交所最新 API 抓取當日所有股票的法人買賣超與持股資料"""
-    # 測試另一種更直接的官方 API 格式
-    url = f"https://www.twse.com.tw/exchangeReport/T86KJ7?response=json&date={date_str}&selectType=ALLBUT0999"
+@st.cache_data(ttl=3600)
+def get_open_stock_data(date_str):
+    """
+    改串全球公開免驗證台股 API 資料源，解決 Streamlit 美國機房 IP 被證交所封鎖的問題。
+    """
+    # 格式化日期為符合 API 需求的 2026-05-27
+    formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
-        "Referer": "https://www.twse.com.tw/zh/page/trading/fund/T86KJ7.html"
-    }
+    # 採用開放籌碼資料節點 (不鎖海外IP)
+    url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&date={formatted_date}"
+    price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&date={formatted_date}"
+    holding_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockShareholding&date={formatted_date}"
     
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        # 1. 抓取法人買賣超
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200 or not resp.json().get("data"):
+            return pd.DataFrame()
         
-        # 偵錯機制：如果不是 200，把錯誤代碼噴在畫面上
-        if response.status_code != 200:
-            st.error(f"🔍 證交所伺服器連線失敗，錯誤代碼 (Status Code): {response.status_code}")
+        raw_data = resp.json()["data"]
+        df_raw = pd.DataFrame(raw_data)
+        
+        # 篩選外資與投信
+        df_f = df_raw[df_raw['name'] == 'Foreign_Investor'].copy()
+        df_s = df_raw[df_raw['name'] == 'Investment_Trust'].copy()
+        
+        # 整理外資與投信數據 (張數 = 股數 / 1000)
+        df_f['外資買進(張)'] = (df_f['buy'] / 1000).round(1)
+        df_f['外資賣出(張)'] = (df_f['sell'] / 1000).round(1)
+        df_f['外資買賣超(張)'] = (df_f['buy_sell'] / 1000).round(1)
+        
+        df_s['投信買進(張)'] = (df_s['buy'] / 1000).round(1)
+        df_s['投信賣出(張)'] = (df_s['sell'] / 1000).round(1)
+        df_s['投信買賣超(張)'] = (df_s['buy_sell'] / 1000).round(1)
+        
+        # 合併法人資料
+        m1 = pd.merge(df_f[['stock_id', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)']], 
+                      df_s[['stock_id', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)']], 
+                      on='stock_id', how='outer').fillna(0)
+        
+        # 2. 抓取當日收盤價與股名
+        resp_p = requests.get(price_url, timeout=15)
+        if resp_p.status_code == 200 and resp_p.json().get("data"):
+            df_p = pd.DataFrame(resp_p.json()["data"])
+            # 取得個股最後一筆價量
+            df_p = df_p.drop_duplicates(subset=['stock_id'], keep='last')
+            m2 = pd.merge(m1, df_p[['stock_id', 'stock_name', 'close', 'change']], on='stock_id', how='inner')
+        else:
             return pd.DataFrame()
             
-        data = response.json()
+        # 3. 抓取外資持股
+        resp_h = requests.get(holding_url, timeout=15)
+        if resp_h.status_code == 200 and resp_h.json().get("data"):
+            df_h = pd.DataFrame(resp_h.json()["data"])
+            df_h = df_h.drop_duplicates(subset=['stock_id'], keep='last')
+            # 欄位對接
+            df_h['外資持股張數'] = (pd.to_numeric(df_h['InternationalInvestorShareholding'], errors='coerce').fillna(0) / 1000).round(0)
+            df_h['外資持股比率(%)'] = pd.to_numeric(df_h['InternationalInvestorShareholdingPercentage'], errors='coerce').fillna(0)
+            
+            final_df = pd.merge(m2, df_h[['stock_id', '外資持股張數', '外資持股比率(%)']], on='stock_id', how='left').fillna(0)
+        else:
+            m2['外資持股張數'] = 0
+            m2['外資持股比率(%)'] = 0
+            final_df = m2
+            
+        final_df['投信持股張數'] = 0
+        final_df['投信持股比率(%)'] = 0
         
-        # 偵錯機制：如果證交所回應說沒有資料，印出原因
-        if "stat" in data and data["stat"] != "OK":
-            st.warning(f"ℹ️ 證交所提示：{data['stat']} (日期: {date_str})")
-            return pd.DataFrame()
-            
-        if "data" in data and len(data["data"]) > 0:
-            cols = data["fields"]
-            rows = data["data"]
-            df = pd.DataFrame(rows, columns=cols)
-            
-            df['證券代號'] = df['證券代號'].str.strip()
-            df['證券名稱'] = df['證券名稱'].str.strip()
-            
-            def clean_num(val):
-                val_str = str(val).replace(',', '').replace(' ', '').strip()
-                return pd.to_numeric(val_str, errors='coerce')
-            
-            df['收盤價'] = clean_num(df['收盤價']).fillna(0)
-            df['外資買進(張)'] = (clean_num(df['外資買進股數']).fillna(0) / 1000).round(1)
-            df['外資賣出(張)'] = (clean_num(df['外資賣出股數']).fillna(0) / 1000).round(1)
-            df['外資買賣超(張)'] = (clean_num(df['外資買賣超股數']).fillna(0) / 1000).round(1)
-            df['投信買進(張)'] = (clean_num(df['投信買進股數']).fillna(0) / 1000).round(1)
-            df['投信賣出(張)'] = (clean_num(df['投信賣出股數']).fillna(0) / 1000).round(1)
-            df['投信買賣超(張)'] = (clean_num(df['投信買賣超股數']).fillna(0) / 1000).round(1)
-            df['外資持股張數'] = (clean_num(df['外資持股股數']).fillna(0) / 1000).round(0)
-            df['外資持股比率(%)'] = clean_num(df['外資持股比率']).fillna(0)
-            df['投信持股張數'] = 0 
-            df['投信持股比率(%)'] = 0
-            df['漲跌'] = df['漲跌'].astype(str).str.replace(' ', '')
-            
-            return df[['證券代號', '證券名稱', '收盤價', '漲跌', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)', '外資持股張數', '外資持股比率(%)', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']]
+        final_df = final_df.rename(columns={
+            'stock_id': '證券代號', 'stock_name': '證券名稱', 
+            'close': '收盤價', 'change': '漲跌'
+        })
         
-        return pd.DataFrame()
+        return final_df[['證券代號', '證券名稱', '收盤價', '漲跌', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)', '外資持股張數', '外資持股比率(%)', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']]
+        
     except Exception as e:
-        st.error(f"💥 程式執行發生未知錯誤: {str(e)}")
         return pd.DataFrame()
 
-# 根據天數取得歷史交易日資料
 def get_historical_data(start_date, max_days=22):
     valid_dfs = []
     dates_list = []
     current_date = start_date
     attempts = 0
     
-    while len(valid_dfs) < max_days and attempts < 45:
+    while len(valid_dfs) < max_days and attempts < 40:
         date_str = current_date.strftime("%Y%m%d")
-        day_df = get_twse_data(date_str)
+        day_df = get_open_stock_data(date_str)
         if not day_df.empty:
             valid_dfs.append(day_df)
             dates_list.append(current_date.strftime("%Y-%m-%d"))
@@ -87,11 +105,11 @@ st.sidebar.header("📅 基準日期設定")
 target_date = st.sidebar.date_input("選擇基準日期", datetime.today())
 st.sidebar.markdown("---")
 
-# 預先抓取最多 22 個交易日（約一個月）的資料
-with st.spinner('🎯 正在從台灣證交所同步最新數據中，請稍候...'):
+# 預先抓取最多 22 個交易日
+with st.spinner('🎯 正在從開放資料源同步最新台股籌碼，請稍候...'):
     dfs, dates_found = get_historical_data(target_date, max_days=22)
 
-# 無論有沒有成功抓到全部資料，直接強制渲染出三個分頁（解決分頁不顯示的問題）
+# 強制渲染三大分頁頁面
 tab1, tab2, tab3 = st.tabs(["🎯 法人連買選股專區", "🦅 外資進出觀測站", "🐯 投信進出觀測站"])
 
 if len(dfs) > 0:
@@ -129,9 +147,9 @@ if len(dfs) > 0:
                 display_df1.columns = ['股號', '股名', '最新股價', '漲跌', '外資當日買超(張)', '外資持股張數', '外資持股比率(%)', '投信當日買超(張)', '投信持股張數', '投信持股比率(%)']
                 st.dataframe(display_df1.reset_index(drop=True), use_container_width=True)
             else:
-                st.info(f"💡 在 {', '.join(dates_found[:filter_days])} 期間，市場上沒有股票符合雙法人同時連買的條件。")
+                st.info(f"💡 在 {', '.join(dates_found[:filter_days])} 期間，市場上沒有股票同時符合雙法人連買條件。")
         else:
-            st.warning(f"⚠️ 目前獲取的交易日數量（{len(dfs)}天）不足以計算 {filter_days} 日連買。")
+            st.warning(f"⚠️ 目前獲取的有效天數（{len(dfs)}天）不足以計算 {filter_days} 日連買。")
 
     # ==========================================
     # 第二頁面
@@ -184,11 +202,4 @@ if len(dfs) > 0:
         
         show_cols_tab3 = ['證券代號', '證券名稱', '收盤價', '漲跌', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']
         display_df3 = df_s_period[show_cols_tab3].copy()
-        display_df3.columns = ['股號', '股名', '股價', '漲跌', f'投信{period_s}買進(張)', f'投信{period_s}賣出(張)', f'投信{period_s}買賣超(張)', '投信持股張數', '投信持股比率(%)']
-        
-        st.caption(f"📊 已成功計算近 {target_len_s} 個交易日累計數據（基準交易日：{dates_found[0]}）")
-        st.dataframe(display_df3, use_container_width=True)
-else:
-    with tab1: st.error("❌ 目前無法取得有效的歷史交易日資料，請查看上方具體的錯誤訊息。")
-    with tab2: st.error("❌ 目前無法取得有效的歷史交易日資料，請查看上方具體的錯誤訊息。")
-    with tab3: st.error("❌ 目前無法取得有效的歷史交易日資料，請查看上方具體的錯誤訊息。")
+        display_df3.columns =
