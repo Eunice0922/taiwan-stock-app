@@ -189,7 +189,7 @@ if len(dfs) > 0:
         st.subheader("🐯 投信多週期進出排行 (真實張數)")
         period_s = st.selectbox("請選擇觀測週期（投信）：", ["當日", "2日", "3日", "5日"], key="p3_select")
         
-        day_mapping = {"當日": 1, "2日", "3日", "5日": 5}
+        day_mapping = {"當日": 1, "2日": 2, "3日": 3, "5日": 5}
         target_len_s = min(day_mapping[period_s], len(dfs))
         
         cum_net_s = sum(dfs[i]['投信買賣超(張)'] for i in range(target_len_s))
@@ -207,7 +207,7 @@ if len(dfs) > 0:
         display_df3 = df_s_period[show_cols_tab3].copy()
         display_df3.columns = ['股號', '股名', '股價', '漲跌', f'投信{period_s}買進(張)', f'投信{period_s}賣出(張)', f'投信{period_s}買賣超(張)', '投信持股張數', '投信持股比率(%)']
         
-        st.caption(f"📊 數據基準日：{dates_found[0]} ｜ 已累計近 {target_len_s} 個交易日真實買賣超張數")
+        day_mapping = {"當日": 1, "2日": 2, "3日": 3, "5日": 5}
         st.dataframe(display_df3, use_container_width=True)
 else:
     st.error("⚠️ 無法成功取得台灣證交所官方資料。請確認您選擇的日期是否為開盤交易日，或在左側面板嘗試調整基準日期。")
