@@ -6,32 +6,35 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="台股法人籌碼大師", layout="wide")
 
 # --- 核心資料抓取與快取函數 ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800) # 縮短快取時間至 30 分鐘，保持資料新鮮度
 def get_open_stock_data(date_str):
     """
     改串全球公開免驗證台股 API 資料源，解決 Streamlit 美國機房 IP 被證交所封鎖的問題。
     """
-    # 格式化日期為符合 API 需求的 2026-05-27
     formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
     
-    # 採用開放籌碼資料節點 (不鎖海外IP)
     url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&date={formatted_date}"
     price_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&date={formatted_date}"
     holding_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockShareholding&date={formatted_date}"
     
     try:
         # 1. 抓取法人買賣超
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(url, timeout=10)
         if resp.status_code != 200 or not resp.json().get("data"):
             return pd.DataFrame()
         
         raw_data = resp.json()["data"]
         df_raw = pd.DataFrame(raw_data)
+        if df_raw.empty:
+            return pd.DataFrame()
         
         # 篩選外資與投信
         df_f = df_raw[df_raw['name'] == 'Foreign_Investor'].copy()
         df_s = df_raw[df_raw['name'] == 'Investment_Trust'].copy()
         
+        if df_f.empty and df_s.empty:
+            return pd.DataFrame()
+            
         # 整理外資與投信數據 (張數 = 股數 / 1000)
         df_f['外資買進(張)'] = (df_f['buy'] / 1000).round(1)
         df_f['外資賣出(張)'] = (df_f['sell'] / 1000).round(1)
@@ -47,24 +50,21 @@ def get_open_stock_data(date_str):
                       on='stock_id', how='outer').fillna(0)
         
         # 2. 抓取當日收盤價與股名
-        resp_p = requests.get(price_url, timeout=15)
+        resp_p = requests.get(price_url, timeout=10)
         if resp_p.status_code == 200 and resp_p.json().get("data"):
             df_p = pd.DataFrame(resp_p.json()["data"])
-            # 取得個股最後一筆價量
             df_p = df_p.drop_duplicates(subset=['stock_id'], keep='last')
             m2 = pd.merge(m1, df_p[['stock_id', 'stock_name', 'close', 'change']], on='stock_id', how='inner')
         else:
             return pd.DataFrame()
             
         # 3. 抓取外資持股
-        resp_h = requests.get(holding_url, timeout=15)
+        resp_h = requests.get(holding_url, timeout=10)
         if resp_h.status_code == 200 and resp_h.json().get("data"):
             df_h = pd.DataFrame(resp_h.json()["data"])
             df_h = df_h.drop_duplicates(subset=['stock_id'], keep='last')
-            # 欄位對接
             df_h['外資持股張數'] = (pd.to_numeric(df_h['InternationalInvestorShareholding'], errors='coerce').fillna(0) / 1000).round(0)
             df_h['外資持股比率(%)'] = pd.to_numeric(df_h['InternationalInvestorShareholdingPercentage'], errors='coerce').fillna(0)
-            
             final_df = pd.merge(m2, df_h[['stock_id', '外資持股張數', '外資持股比率(%)']], on='stock_id', how='left').fillna(0)
         else:
             m2['外資持股張數'] = 0
@@ -80,8 +80,7 @@ def get_open_stock_data(date_str):
         })
         
         return final_df[['證券代號', '證券名稱', '收盤價', '漲跌', '外資買進(張)', '外資賣出(張)', '外資買賣超(張)', '外資持股張數', '外資持股比率(%)', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']]
-        
-    except Exception as e:
+    except Exception:
         return pd.DataFrame()
 
 def get_historical_data(start_date, max_days=22):
@@ -90,7 +89,8 @@ def get_historical_data(start_date, max_days=22):
     current_date = start_date
     attempts = 0
     
-    while len(valid_dfs) < max_days and attempts < 40:
+    # 限制最多往回撈 35 天，避免開放資料源過載而卡死
+    while len(valid_dfs) < max_days and attempts < 35:
         date_str = current_date.strftime("%Y%m%d")
         day_df = get_open_stock_data(date_str)
         if not day_df.empty:
@@ -105,18 +105,18 @@ st.sidebar.header("📅 基準日期設定")
 target_date = st.sidebar.date_input("選擇基準日期", datetime.today())
 st.sidebar.markdown("---")
 
-# 預先抓取最多 22 個交易日
+# 預先抓取交易日資料
 with st.spinner('🎯 正在從開放資料源同步最新台股籌碼，請稍候...'):
     dfs, dates_found = get_historical_data(target_date, max_days=22)
 
-# 強制渲染三大分頁頁面
+# --- 分頁系統全面強制展開 ---
 tab1, tab2, tab3 = st.tabs(["🎯 法人連買選股專區", "🦅 外資進出觀測站", "🐯 投信進出觀測站"])
 
 if len(dfs) > 0:
     df_latest = dfs[0].copy()
     
     # ==========================================
-    # 第一頁面
+    # 第一頁面：外資及投信連買超 3日、5日
     # ==========================================
     with tab1:
         st.subheader("🔥 外資與投信聯手連買篩選")
@@ -147,12 +147,12 @@ if len(dfs) > 0:
                 display_df1.columns = ['股號', '股名', '最新股價', '漲跌', '外資當日買超(張)', '外資持股張數', '外資持股比率(%)', '投信當日買超(張)', '投信持股張數', '投信持股比率(%)']
                 st.dataframe(display_df1.reset_index(drop=True), use_container_width=True)
             else:
-                st.info(f"💡 在 {', '.join(dates_found[:filter_days])} 期間，市場上沒有股票同時符合雙法人連買條件。")
+                st.info(f"💡 在近 {filter_days} 個交易日（{', '.join(dates_found[:filter_days])}）期間，台股市場上沒有股票同時符合外資與投信「天天連買」的條件。")
         else:
-            st.warning(f"⚠️ 目前獲取的有效天數（{len(dfs)}天）不足以計算 {filter_days} 日連買。")
+            st.warning(f"⚠️ 目前系統僅成功加載到 {len(dfs)} 個交易日的資料，不足以計算 {filter_days} 日連買。請嘗試在側邊欄切換其他基準日期。")
 
     # ==========================================
-    # 第二頁面
+    # 第二頁面：外資多週期
     # ==========================================
     with tab2:
         st.subheader("🦅 外資多週期進出排行")
@@ -180,7 +180,7 @@ if len(dfs) > 0:
         st.dataframe(display_df2, use_container_width=True)
 
     # ==========================================
-    # 第三頁面
+    # 第三頁面：投信多週期
     # ==========================================
     with tab3:
         st.subheader("🐯 投信多週期進出排行")
@@ -203,3 +203,11 @@ if len(dfs) > 0:
         show_cols_tab3 = ['證券代號', '證券名稱', '收盤價', '漲跌', '投信買進(張)', '投信賣出(張)', '投信買賣超(張)', '投信持股張數', '投信持股比率(%)']
         display_df3 = df_s_period[show_cols_tab3].copy()
         display_df3.columns = ['股號', '股名', '股價', '漲跌', f'投信{period_s}買進(張)', f'投信{period_s}賣出(張)', f'投信{period_s}買賣超(張)', '投信持股張數', '投信持股比率(%)']
+        
+        st.caption(f"📊 已成功計算近 {target_len_s} 個交易日累計數據（基準交易日：{dates_found[0]}）")
+        st.dataframe(display_df3, use_container_width=True)
+
+else:
+    with tab1: st.error("❌ 無法載入籌碼數據。可能原因：您選擇的基準日期為非交易日（如週末或國定假日），或是該日資料尚未發布。請在左側面板嘗試切換日期。")
+    with tab2: st.error("❌ 無法載入籌碼數據。請檢查左側日期設定。")
+    with tab3: st.error("❌ 無法載入籌碼數據。請檢查左側日期設定。")
